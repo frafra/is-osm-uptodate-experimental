@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+from datetime import datetime
+import io
+
+import aiohttp
+from aiohttp import web
+import asyncio
+import httpx
+
+import mercantile
+import png
+
+"""
+URL = "https://api.ohsome.org/v1/elementsFullHistory/bbox"
+
+META = "https://api.ohsome.org/v1/metadata"
+temporal_extent = requests.get(META).json()["extractRegion"]["temporalExtent"]
+start = temporal_extent['fromTimestamp']
+end = temporal_extent['toTimestamp']
+
+
+
+def data_ohsome(bbox):
+    response = requests.get(URL, params={
+        "bboxes": f"{bbox.west},{bbox.south},{bbox.east},{bbox.north}",
+        "properties": "tags",
+        "showMetadata": False,
+        "time": f"{start},{end}",
+        "types": "node",
+    }).json()
+"""
+
+app = web.Application()
+routes = web.RouteTableDef()
+
+
+server = "https://api.openstreetmap.org"
+
+
+def timestamp_to_days(timestamp):
+    print(timestamp)
+    return (datetime.now() - datetime.fromisoformat(timestamp.rstrip("Z"))).days
+
+
+headers = {
+    "User-Agent": "Is-OSM-uptodate/EXPERIMENTAL_VERSION",
+    "Referer": "185.71.208.252",
+    "Accept-Encoding": "gzip",
+}
+"""
+async def create_session(app):
+    conn = aiohttp.TCPConnector(limit_per_host=1000, force_close=True)
+    session = aiohttp.ClientSession(connector=conn)
+    app['MY_PERSISTENT_SESSION'] = session
+
+async def close_session(app):
+    await app['MY_PERSISTENT_SESSION'].close()
+
+
+app.on_startup.append(create_session)
+app.on_shutdown.append(close_session)
+"""
+
+# httpx.Limits(max_keepalive_connections=1, max_connections=1)
+
+
+async def create_client(app):
+    app["MY_PERSISTENT_CLIENT"] = httpx.AsyncClient(http2=True, headers=headers)
+
+
+async def close_client(app):
+    await app["MY_PERSISTENT_CLIENT"].aclose()
+
+
+app.on_startup.append(create_client)
+app.on_shutdown.append(close_client)
+
+
+async def fetch(url, client):
+    try:
+        return (await client.get(url)).json()
+    except:
+        print("Failure")
+        await asyncio.sleep(0.1)
+        #        client = httpx.AsyncClient(http2=True, headers=headers)
+        res = await fetch(url, client)
+        #        await client.aclose()
+        return res
+
+
+#    async with session.get(url, headers=headers) as response:
+#        return await response.json() # content_type=None
+
+
+async def data_osm(client, bbox):
+
+    nodes = 0
+    versions_total = 0
+    # users_total = 0
+    last = ""
+    first = "_"
+    tasks = []
+
+    histories = []
+    #    connector = aiohttp.TCPConnector(limit=4)
+    url = f"{server}/api/0.6/map.json?bbox={bbox.west},{bbox.south},{bbox.east},{bbox.north}"
+    res = await client.get(url)
+    response_bbox = res.json()
+    #    async with session.get(url) as resp:
+    #        response_bbox = await resp.json()
+    for element in response_bbox["elements"]:
+        if element["type"] != "node":
+            continue
+        nodes += 1
+        versions_total += element["version"]
+        if element["timestamp"] > last:
+            last = element["timestamp"]
+        if element["version"] == 1:
+            created = element["timestamp"]
+            if created < first:
+                first = created
+        task = asyncio.ensure_future(
+            fetch(
+                f"{server}/api/0.6/{element['type']}/{element['id']}/history.json",
+                client,
+            )
+        )
+        tasks.append(task)
+
+    histories = await asyncio.gather(*tasks)
+
+    for history in histories:
+        if len(history["elements"]) == 0:
+            continue
+        created = history["elements"][0]["timestamp"]
+        if created < first:
+            first = created
+    #    users = set((version['uid'] for version in response_history['elements']))
+    #    users_total += len(users)
+
+    if len(histories) == 0:
+        return {
+            "versions_avg": 1,
+            "updates_freq": None,
+            "last": None,
+            "first": None,
+        }
+    first_days = timestamp_to_days(first)
+    last_days = timestamp_to_days(last)
+    return {
+        "versions_avg": versions_total / nodes,
+        "updates_freq": None,
+        "last": last_days,
+        "first": first_days,
+    }
+
+
+def coordinates_to_bbox(x, y, z):
+    return mercantile.bounds(mercantile.Tile(x, y, z))
+
+
+# Web Mercator is the projection of reference, and the Google tile scheme is the tile extent convention of reference.
+@routes.get("/{z}/{x}/{y}.png")
+async def tile(request):
+    z = int(request.match_info["z"])
+    x = int(request.match_info["x"])
+    y = int(request.match_info["y"])
+    #    session = request.app['MY_PERSISTENT_SESSION']
+    client = request.app["MY_PERSISTENT_CLIENT"]
+    bbox = await loop.run_in_executor(None, coordinates_to_bbox, x, y, z)
+    tile = io.BytesIO()
+    writer = png.Writer(256, 256, greyscale=True)
+    avg = (await data_osm(client, bbox))["versions_avg"]
+    if avg > 3:
+        avg = 3
+    value = round((3 - avg) * (255 / (3 - 1)))
+    writer.write(tile, [[value] * 256] * 256)
+    tile.seek(0)
+    return web.Response(body=tile.read(), content_type="image/png")
+
+
+def get_tiles(z, x, y):
+    if z < 1 or z > 19:
+        return None  # invalid
+    if z == 19:
+        return [[z, x, y]]
+    return (
+        get_tiles(z + 1, 2 * x, 2 * y)
+        + get_tiles(z + 1, 2 * x + 1, 2 * y)
+        + get_tiles(z + 1, 2 * x, 2 * y + 1)
+        + get_tiles(z + 1, 2 * x + 1, 2 * y + 1)
+    )
+
+
+# mercantile.children(Tile(x, y, z))
+
+app.add_routes(routes)
+loop = asyncio.get_event_loop()
+
+if __name__ == "__main__":
+    web.run_app(app)
